@@ -6,21 +6,16 @@ import 'package:flutter/material.dart';
 import 'package:flutter/rendering.dart';
 import 'package:flutter/scheduler.dart';
 
-/// Demo: dark <-> light theme switch where the new theme pours out of the
-/// toggle button as liquid paint.
+/// Demo: dark <-> light theme switch where the new theme spills out of the
+/// toggle button like liquid spreading across the screen.
 ///
 /// How it works:
 ///  1. Take a screenshot of the screen in its current theme.
 ///  2. Switch the theme underneath.
-///  3. Run a small liquid simulation ([_LiquidSim]) and use the liquid as a
-///     mask that erases the old screenshot, so the new theme "is" the paint:
-///       - a burst of paint splashes out of the button, then a stream pours
-///       - gravity pulls the drops down; they bounce off the screen edges
-///       - drops land in a pool that fills the screen from the bottom up
-///       - every impact makes the pool surface ripple and slosh, and fast
-///         drops throw up splash droplets
-///     Drops are drawn through a blur + alpha-threshold ("metaball") filter,
-///     so nearby drops merge and pinch apart like real liquid.
+///  3. Run a small spill simulation ([_LiquidSim]) and erase the screenshot
+///     wherever the liquid has reached, so the new theme "is" the liquid.
+///     The edge is drawn through a blur + alpha-threshold ("metaball") filter
+///     so it stays round and wobbly and merges with blobs like real liquid.
 class InkSplashThemeDemo extends StatefulWidget {
   const InkSplashThemeDemo({super.key});
 
@@ -142,192 +137,143 @@ class _InkSplashThemeDemoState extends State<InkSplashThemeDemo>
   }
 }
 
-/// One blob of paint flying through the air.
-class _Drop {
-  _Drop(this.pos, this.vel, this.r, {this.splash = false});
-  Offset pos;
-  Offset vel;
-  final double r;
-
-  /// Splash droplets are thrown up out of the pool, so they carry no new
-  /// volume when they fall back in.
-  final bool splash;
+/// A small blob of liquid that has run out ahead of the main front.
+class _Blob {
+  _Blob(this.pos, this.r);
+  final Offset pos;
+  double r;
 }
 
-/// A tiny, cheap liquid simulation (pixels and seconds):
-///  - drops: point particles with gravity, air drag and wall bounces
-///  - pool: a rising level plus a 1D wave height-field for the surface
+/// Liquid spilling across a flat surface, seen from above.
+///
+/// The edge of the spill is a polar curve around the button: one radius per
+/// angle. Every frame each radius advances at its own speed:
+///  - a moving pattern of "surges" makes some parts race ahead as fingers
+///    while others hold back, and the pattern keeps shifting over time;
+///  - surface tension (smoothing between neighbours) rounds the fingers into
+///    lobes and pulls lagging parts forward;
+///  - small blobs run out ahead of the fastest fingers and get swallowed when
+///    the front reaches them.
 class _LiquidSim extends ChangeNotifier {
   _LiquidSim({required this.size, required this.source}) {
-    // Initial burst: paint splashes out of the button in all directions.
-    for (var i = 0; i < 30; i++) {
-      final a = _rnd.nextDouble() * math.pi * 2;
-      final speed = 150 + _rnd.nextDouble() * 550;
-      drops.add(
-        _Drop(
-          source,
-          Offset.fromDirection(a, speed) + const Offset(0, -100),
-          6 + _rnd.nextDouble() * 9,
-        ),
-      );
+    for (var i = 0; i < _n; i++) {
+      _rayLen[i] = _distanceToEdge(i * _da);
+    }
+    for (var k = 3; k <= 14; k++) {
+      _surges.add((
+        freq: k,
+        amp:
+            (k < 7 ? 0.5 : 0.22) * (0.5 + _rnd.nextDouble()) / math.sqrt(k / 3),
+        phase: _rnd.nextDouble() * math.pi * 2,
+        drift: (_rnd.nextDouble() - 0.5) * 3, // how fast the pattern shifts
+      ));
     }
   }
 
-  static const _cols = 80; // surface resolution
-  static const _gravity = 2600.0;
-  static const _emitRate = 150.0; // stream drops per second
-  static const _fillSeconds = 2.6; // ~time for the pool to fill the screen
-  static const _waveSpeed = 340.0;
-  static const _maxDrops = 320;
+  static const _n = 180; // edge resolution
+  static const _da = math.pi * 2 / _n;
+  static const _speed = 400.0; // average spreading speed, px/s
+  static const _tension = 0.35; // surface-tension smoothing strength
 
   final Size size;
   final Offset source;
   final _rnd = math.Random();
-  final drops = <_Drop>[];
-  final _h = Float64List(_cols); // surface displacement (up = positive)
-  final _v = Float64List(_cols); // surface vertical velocity
+  final radius = Float64List(_n);
+  final _rayLen = Float64List(_n);
+  final _surges = <({int freq, double amp, double phase, double drift})>[];
+  final blobs = <_Blob>[];
 
-  /// Height of the calm pool surface above the bottom of the screen.
-  double level = 0;
   double _elapsed = 0;
-  double _emitAcc = 0;
+  double _blobTimer = 0;
   bool done = false;
 
-  double get _dx => size.width / (_cols - 1);
+  double angleOf(int i) => i * _da;
 
-  /// Total pool height needed (with margin so waves don't peek through).
-  double get _fullLevel => size.height + 90;
-
-  /// Level gained per absorbed stream drop of radius 9.
-  double get _volumePerDrop => _fullLevel / (_emitRate * _fillSeconds);
-
-  double columnY(int i) => size.height - level - _h[i];
-
-  double surfaceY(double x) {
-    final f = (x / _dx).clamp(0.0, _cols - 1.0);
-    final i = f.floor().clamp(0, _cols - 2);
-    final t = f - i;
-    return size.height - level - (_h[i] * (1 - t) + _h[i + 1] * t);
+  /// How far the screen extends from the button in direction [a].
+  double _distanceToEdge(double a) {
+    final dx = math.cos(a), dy = math.sin(a);
+    var t = double.infinity;
+    if (dx > 1e-9) t = math.min(t, (size.width - source.dx) / dx);
+    if (dx < -1e-9) t = math.min(t, -source.dx / dx);
+    if (dy > 1e-9) t = math.min(t, (size.height - source.dy) / dy);
+    if (dy < -1e-9) t = math.min(t, -source.dy / dy);
+    return t;
   }
 
-  bool get _sourceCovered => surfaceY(source.dx) < source.dy - 14;
+  double _surge(double a) {
+    var v = 0.0;
+    for (final s in _surges) {
+      v += s.amp * math.sin(s.freq * a + s.phase + s.drift * _elapsed);
+    }
+    return v;
+  }
 
   void step(double dt) {
     _elapsed += dt;
+    // A quick gush at first, then a steady push; after 3s hurry up so it
+    // always finishes.
+    final gush = 1 + 1.2 * math.exp(-_elapsed * 3);
+    final hurry = _elapsed > 3 ? 1 + (_elapsed - 3) * 3 : 1.0;
 
-    // The stream keeps pouring until the pool rises over the button; after
-    // that the paint keeps welling up at the same pace.
-    if (!_sourceCovered) {
-      _emitAcc += dt * _emitRate;
-      while (_emitAcc >= 1 && drops.length < _maxDrops) {
-        _emitAcc -= 1;
-        drops.add(
-          _Drop(
-            source + Offset((_rnd.nextDouble() - 0.5) * 8, 8),
-            Offset(
-              -40 + (_rnd.nextDouble() - 0.5) * 50,
-              60 + _rnd.nextDouble() * 80,
-            ),
-            7.5 + _rnd.nextDouble() * 3,
-          ),
-        );
+    var best = 0, bestSurge = -1e9;
+    var complete = true;
+    for (var i = 0; i < _n; i++) {
+      final cap = _rayLen[i] + 70;
+      if (radius[i] >= cap) continue;
+      complete = false;
+      final m = _surge(i * _da);
+      if (m > bestSurge && radius[i] < _rayLen[i]) {
+        bestSurge = m;
+        best = i;
       }
-    } else {
-      level += dt * _fullLevel / _fillSeconds;
+      final v = _speed * gush * hurry * math.max(0.12, 1 + m);
+      radius[i] = math.min(cap, radius[i] + v * dt);
     }
 
-    // Fixed sub-steps keep the wave equation stable.
-    const sub = 1 / 240;
-    var rest = dt;
-    while (rest > 1e-6) {
-      final s = math.min(sub, rest);
-      _substep(s);
-      rest -= s;
+    // Surface tension: pull each point toward its neighbours (a few passes).
+    for (var pass = 0; pass < 2; pass++) {
+      final prev = Float64List.fromList(radius);
+      for (var i = 0; i < _n; i++) {
+        final l = prev[(i - 1 + _n) % _n], r = prev[(i + 1) % _n];
+        final avg = (l + r) / 2;
+        // Only pull forward-lagging points up and round off sharp tips;
+        // never shrink much, liquid doesn't retreat.
+        radius[i] = math.max(prev[i] - 2, prev[i] + (avg - prev[i]) * _tension);
+      }
     }
 
-    var top = double.infinity;
-    for (var i = 0; i < _cols; i++) {
-      top = math.min(top, columnY(i));
+    // Blobs run out ahead of the fastest finger now and then.
+    _blobTimer -= dt;
+    if (_blobTimer <= 0 && radius[best] > 30 && radius[best] < _rayLen[best]) {
+      _blobTimer = 0.04 + _rnd.nextDouble() * 0.08;
+      final a = best * _da + (_rnd.nextDouble() - 0.5) * 0.25;
+      final ahead = radius[best] + 18 + _rnd.nextDouble() * 40;
+      blobs.add(
+        _Blob(
+          source + Offset.fromDirection(a, ahead),
+          5 + _rnd.nextDouble() * 9,
+        ),
+      );
     }
-    done = (top < -25 && drops.isEmpty) || _elapsed > 9;
+    for (final b in blobs) {
+      b.r += dt * 18; // they spread a little on their own
+    }
+    blobs.removeWhere((b) => _swallowed(b));
+
+    done = complete || _elapsed > 7;
     notifyListeners();
   }
 
-  void _substep(double dt) {
-    // --- Pool surface: damped wave equation with a weak pull back to flat.
-    final tension = _waveSpeed * _waveSpeed / (_dx * _dx);
-    for (var i = 0; i < _cols; i++) {
-      final l = _h[math.max(i - 1, 0)];
-      final r = _h[math.min(i + 1, _cols - 1)];
-      final acc = tension * (l + r - 2 * _h[i]) - 12 * _h[i] - 2.4 * _v[i];
-      _v[i] += acc * dt;
-    }
-    for (var i = 0; i < _cols; i++) {
-      _h[i] = (_h[i] + _v[i] * dt).clamp(-90.0, 90.0);
-    }
-
-    // --- Drops: gravity, air drag, walls, landing in the pool.
-    final drag = 1 - 0.5 * dt;
-    for (var k = drops.length - 1; k >= 0; k--) {
-      final d = drops[k];
-      d.vel = Offset(d.vel.dx * drag, (d.vel.dy + _gravity * dt) * drag);
-      d.pos += d.vel * dt;
-
-      final w = size.width;
-      if (d.pos.dx < d.r && d.vel.dx < 0) {
-        d.pos = Offset(d.r, d.pos.dy);
-        d.vel = Offset(-d.vel.dx * 0.3, d.vel.dy * 0.8); // wet wall: sticky
-      } else if (d.pos.dx > w - d.r && d.vel.dx > 0) {
-        d.pos = Offset(w - d.r, d.pos.dy);
-        d.vel = Offset(-d.vel.dx * 0.3, d.vel.dy * 0.8);
-      }
-      if (d.pos.dy < d.r && d.vel.dy < 0) {
-        d.pos = Offset(d.pos.dx, d.r);
-        d.vel = Offset(d.vel.dx * 0.8, -d.vel.dy * 0.2);
-      }
-
-      if (d.pos.dy + d.r * 0.3 >= surfaceY(d.pos.dx)) {
-        drops.removeAt(k);
-        _land(d);
-      }
-    }
-  }
-
-  void _land(_Drop d) {
-    final mass = (d.r * d.r) / 81; // relative to a radius-9 drop
-    if (!d.splash) level += _volumePerDrop * mass;
-
-    // Push the surface down where it hit -> ripples travel outward.
-    final c = (d.pos.dx / _dx).round();
-    final impulse = d.vel.dy * 0.1 * mass;
-    for (var k = -3; k <= 3; k++) {
-      final i = c + k;
-      if (i < 0 || i >= _cols) continue;
-      _v[i] -= impulse * math.exp(-k * k / 3);
-    }
-
-    // Fast drops throw up a crown of splash droplets.
-    if (d.vel.dy > 1100 && d.r > 5.5 && drops.length < _maxDrops) {
-      final n = 1 + _rnd.nextInt(3);
-      for (var j = 0; j < n; j++) {
-        final r = math.max(4.5, d.r * (0.4 + _rnd.nextDouble() * 0.3));
-        drops.add(
-          _Drop(
-            Offset(d.pos.dx, surfaceY(d.pos.dx) - r - 2),
-            Offset(
-              (_rnd.nextDouble() - 0.5) * 420 + d.vel.dx * 0.3,
-              -(0.15 + _rnd.nextDouble() * 0.22) * d.vel.dy,
-            ),
-            r,
-            splash: true,
-          ),
-        );
-      }
-    }
+  bool _swallowed(_Blob b) {
+    final d = b.pos - source;
+    var a = d.direction;
+    if (a < 0) a += math.pi * 2;
+    final i = (a / _da).round() % _n;
+    return radius[i] > d.distance + b.r;
   }
 }
 
-/// Draws the old-theme screenshot with the liquid erased out of it.
+/// Draws the old-theme screenshot with the spilled liquid erased out of it.
 class _LiquidPainter extends CustomPainter {
   _LiquidPainter({required this.image, required this.sim})
     : super(repaint: sim);
@@ -335,21 +281,23 @@ class _LiquidPainter extends CustomPainter {
   final ui.Image image;
   final _LiquidSim sim;
 
-  // Metaball trick: blur the drops, then keep only pixels whose alpha is over
-  // ~40% with a sharp edge. Close drops merge, separating drops "neck" apart.
+  // Metaball trick: blur, then keep only pixels with alpha over ~45% with a
+  // sharp edge. Edges get round like surface tension, and blobs near the
+  // front reach out and merge with it like real liquid.
   static final _gooey = ui.ImageFilter.compose(
     outer: const ColorFilter.matrix([
       1, 0, 0, 0, 0, //
       0, 1, 0, 0, 0,
       0, 0, 1, 0, 0,
-      0, 0, 0, 22, -22 * 0.4 * 255,
+      0, 0, 0, 22, -22 * 0.45 * 255,
     ]),
-    inner: ui.ImageFilter.blur(sigmaX: 4.5, sigmaY: 4.5),
+    inner: ui.ImageFilter.blur(sigmaX: 7, sigmaY: 7),
   );
 
   @override
   void paint(Canvas canvas, Size size) {
     final rect = Offset.zero & size;
+    final front = _frontPath(0);
 
     canvas.saveLayer(rect, Paint());
     canvas.drawImageRect(
@@ -359,59 +307,54 @@ class _LiquidPainter extends CustomPainter {
       Paint()..filterQuality = FilterQuality.medium,
     );
 
-    // Everything drawn in this layer erases the screenshot (dstOut).
+    // Soft shadow just outside the liquid: it looks thick and wet.
+    canvas.saveLayer(
+      rect.inflate(60),
+      Paint()
+        ..color = Colors.black.withValues(alpha: 0.28)
+        ..imageFilter = ui.ImageFilter.blur(sigmaX: 6, sigmaY: 6),
+    );
+    final ink = Paint()..color = Colors.black;
+    canvas.drawPath(_frontPath(4), ink);
+    for (final b in sim.blobs) {
+      canvas.drawCircle(b.pos, b.r + 3, ink);
+    }
+    canvas.restore();
+
+    // Erase the liquid area -> the new theme shows through.
     canvas.saveLayer(
       rect.inflate(60),
       Paint()
         ..blendMode = BlendMode.dstOut
         ..imageFilter = _gooey,
     );
-    final ink = Paint()..color = Colors.black;
-    canvas.drawPath(_surfacePath(size, closed: true), ink);
-    for (final d in sim.drops) {
-      // Slightly oversized: the threshold filter shrinks blobs a little.
-      canvas.drawCircle(d.pos, d.r * 1.15, ink);
+    canvas.drawPath(front, ink);
+    for (final b in sim.blobs) {
+      canvas.drawCircle(b.pos, b.r * 1.2, ink);
     }
     canvas.restore();
     canvas.restore();
 
-    // Glossy highlight just under the pool surface sells the "wet" look.
-    if (sim.level > 0) {
-      canvas.save();
-      canvas.clipRect(rect);
-      canvas.translate(0, 5);
-      canvas.drawPath(
-        _surfacePath(size, closed: false),
-        Paint()
-          ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.5
-          ..strokeCap = StrokeCap.round
-          ..color = Colors.white.withValues(alpha: 0.22),
-      );
-      canvas.restore();
-    }
+    // Wet sheen: a faint highlight running just inside the edge.
+    canvas.drawPath(
+      _frontPath(-7),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = 3
+        ..color = Colors.white.withValues(alpha: 0.16)
+        ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 1.5),
+    );
   }
 
-  Path _surfacePath(Size size, {required bool closed}) {
+  /// The spill outline, pushed out by [grow] px (negative = inside).
+  Path _frontPath(double grow) {
     final path = Path();
-    const pad = 60.0;
-    if (closed) {
-      path
-        ..moveTo(-pad, size.height + pad)
-        ..lineTo(-pad, sim.columnY(0));
-    } else {
-      path.moveTo(0, sim.columnY(0));
+    for (var i = 0; i < _LiquidSim._n; i++) {
+      final r = math.max(0.0, sim.radius[i] + grow);
+      final p = sim.source + Offset.fromDirection(sim.angleOf(i), r);
+      i == 0 ? path.moveTo(p.dx, p.dy) : path.lineTo(p.dx, p.dy);
     }
-    for (var i = 0; i < _LiquidSim._cols; i++) {
-      path.lineTo(i * sim._dx, sim.columnY(i));
-    }
-    if (closed) {
-      path
-        ..lineTo(size.width + pad, sim.columnY(_LiquidSim._cols - 1))
-        ..lineTo(size.width + pad, size.height + pad)
-        ..close();
-    }
-    return path;
+    return path..close();
   }
 
   @override
